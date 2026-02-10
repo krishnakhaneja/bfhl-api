@@ -84,6 +84,8 @@ public class ApiController {
             case "AI" -> {
                 if (!(value instanceof String)) throw new BadRequestException("AI must be a string.");
                 String q = ((String) value).trim();
+                System.out.println("AI HIT: " + q);
+
                 String ans = geminiService.oneWordAnswer(q);
                 if (ans == null || ans.isEmpty()) {
                     throw new RuntimeException("AI returned empty answer.");
