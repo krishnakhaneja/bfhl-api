@@ -85,7 +85,6 @@ public class GeminiService { // keep name to avoid controller changes
             System.out.println("GROQ BODY: " + e.getResponseBodyAsString());
             return "Unknown";
         } catch (Exception e) {
-            e.printStackTrace();
             return "Unknown";
         }
     }
