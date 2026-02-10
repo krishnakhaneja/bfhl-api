@@ -22,8 +22,8 @@ public class GeminiService {
             .baseUrl("https://generativelanguage.googleapis.com")
             .build();
 
-    // cache the chosen model name to avoid listModels every request
-    private volatile String cachedModel = null;
+    // cache selected model so we don't call listModels every request
+    private volatile String cachedModelName = null; // e.g. "models/gemini-2.0-flash"
 
     public String oneWordAnswer(String question) {
         if (question == null || question.trim().isEmpty()) {
@@ -39,10 +39,12 @@ public class GeminiService {
             throw new RuntimeException("GEMINI_API_KEY missing in environment variables.");
         }
 
-        String model = (cachedModel != null) ? cachedModel : pickWorkingModel(key);
-        cachedModel = model; // cache it
+        // pick a working model (once) and cache it
+        String modelName = (cachedModelName != null) ? cachedModelName : pickGenerateContentModel(key);
+        cachedModelName = modelName;
 
-        String path = "/v1beta/models/" + model + ":generateContent?key=" + key;
+        // API expects: /v1beta/{model=models/*}:generateContent
+        String path = "/v1beta/" + modelName + ":generateContent?key=" + key;
 
         Map<String, Object> payload = Map.of(
                 "contents", List.of(
@@ -73,17 +75,21 @@ public class GeminiService {
             if (!(candObj instanceof List<?> candidates) || candidates.isEmpty()) {
                 throw new RuntimeException("Gemini returned no candidates.");
             }
+
             if (!(candidates.get(0) instanceof Map<?, ?> c0)) {
                 throw new RuntimeException("Gemini candidate format invalid.");
             }
+
             Object contentObj = c0.get("content");
             if (!(contentObj instanceof Map<?, ?> content)) {
                 throw new RuntimeException("Gemini content missing.");
             }
+
             Object partsObj = content.get("parts");
             if (!(partsObj instanceof List<?> parts) || parts.isEmpty()) {
                 throw new RuntimeException("Gemini returned empty parts.");
             }
+
             if (!(parts.get(0) instanceof Map<?, ?> p0)) {
                 throw new RuntimeException("Gemini part format invalid.");
             }
@@ -91,6 +97,7 @@ public class GeminiService {
             String text = String.valueOf(p0.get("text"));
             String one = extractFirstWord(text);
             if (one.isEmpty()) throw new RuntimeException("Could not extract single-word answer: " + text);
+
             return one;
 
         } catch (WebClientResponseException e) {
@@ -100,15 +107,9 @@ public class GeminiService {
         }
     }
 
-    private String pickWorkingModel(String key) {
-        // Try common models first (fast path)
-        List<String> common = List.of("gemini-pro", "models/gemini-pro");
-        for (String m : common) {
-            if (works(m, key)) return normalize(m);
-        }
-
-        // Otherwise list models and pick one that supports generateContent
+    private String pickGenerateContentModel(String key) {
         String listPath = "/v1beta/models?key=" + key;
+
         try {
             Map<?, ?> resp = webClient.get()
                     .uri(listPath)
@@ -118,64 +119,44 @@ public class GeminiService {
                     .timeout(Duration.ofSeconds(20))
                     .block();
 
-            Object modelsObj = (resp == null) ? null : resp.get("models");
+            if (resp == null) throw new RuntimeException("models.list returned empty response.");
+
+            Object modelsObj = resp.get("models");
             if (!(modelsObj instanceof List<?> models) || models.isEmpty()) {
                 throw new RuntimeException("No models available for this API key.");
             }
 
             for (Object o : models) {
-                if (!(o instanceof Map<?, ?> mm)) continue;
-                Object nameObj = mm.get("name"); // e.g. "models/gemini-pro"
-                Object methodsObj = mm.get("supportedGenerationMethods");
-                if (!(nameObj instanceof String name)) continue;
+                if (!(o instanceof Map<?, ?> m)) continue;
 
-                if (methodsObj instanceof List<?> methods) {
-                    for (Object method : methods) {
-                        if ("generateContent".equals(String.valueOf(method))) {
-                            // name looks like "models/xyz" -> normalize to "xyz"
-                            return normalize(name);
-                        }
-                    }
+                Object nameObj = m.get("name"); // e.g. "models/gemini-2.0-flash"
+                if (!(nameObj instanceof String name) || name.isBlank()) continue;
+
+                // new docs mention "supportedActions", some responses use "supportedGenerationMethods"
+                Object actionsObj = m.get("supportedActions");
+                Object methodsObj = m.get("supportedGenerationMethods");
+
+                if (supportsGenerateContent(actionsObj) || supportsGenerateContent(methodsObj)) {
+                    // return full "models/xxx" name
+                    return name;
                 }
             }
 
-            throw new RuntimeException("No model supports generateContent for this API key.");
+            throw new RuntimeException("No available model supports generateContent for this API key.");
+
+        } catch (WebClientResponseException e) {
+            throw new RuntimeException("models.list HTTP error: " + e.getStatusCode().value() + " :: " + e.getResponseBodyAsString());
         } catch (Exception e) {
             throw new RuntimeException("Failed to list models: " + e.getMessage());
         }
     }
 
-    private boolean works(String model, String key) {
-        String m = normalize(model);
-        String path = "/v1beta/models/" + m + ":generateContent?key=" + key;
-        Map<String, Object> payload = Map.of(
-                "contents", List.of(
-                        Map.of("role", "user", "parts", List.of(Map.of("text", "Hi")))
-                ),
-                "generationConfig", Map.of("maxOutputTokens", 4)
-        );
-
-        try {
-            webClient.post()
-                    .uri(path)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .accept(MediaType.APPLICATION_JSON)
-                    .bodyValue(payload)
-                    .retrieve()
-                    .bodyToMono(Map.class)
-                    .timeout(Duration.ofSeconds(10))
-                    .block();
-            return true;
-        } catch (Exception ignored) {
-            return false;
+    private boolean supportsGenerateContent(Object obj) {
+        if (!(obj instanceof List<?> list)) return false;
+        for (Object x : list) {
+            if ("generateContent".equals(String.valueOf(x))) return true;
         }
-    }
-
-    private String normalize(String modelName) {
-        // Accept "models/gemini-pro" or "gemini-pro" -> return "gemini-pro"
-        String s = modelName.trim();
-        if (s.startsWith("models/")) s = s.substring("models/".length());
-        return s;
+        return false;
     }
 
     private String extractFirstWord(String text) {
