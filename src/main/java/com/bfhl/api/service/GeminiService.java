@@ -2,28 +2,28 @@ package com.bfhl.api.service;
 
 import com.bfhl.api.exception.BadRequestException;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import java.time.Duration;
-import java.util.*;
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Service
-public class GeminiService {
+public class GeminiService { // keep name to avoid controller changes
 
-    @Value("${GEMINI_API_KEY:}")
-    private String geminiKey;
+    @Value("${GROQ_API_KEY:}")
+    private String groqKey;
 
     private final WebClient webClient = WebClient.builder()
-            .baseUrl("https://generativelanguage.googleapis.com")
+            .baseUrl("https://api.groq.com/openai/v1")
+            .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
             .build();
-
-    // cache selected model so we don't call listModels every request
-    private volatile String cachedModelName = null; // e.g. "models/gemini-2.0-flash"
 
     public String oneWordAnswer(String question) {
         if (question == null || question.trim().isEmpty()) {
@@ -34,34 +34,32 @@ public class GeminiService {
             throw new BadRequestException("AI string too long (max 500).");
         }
 
-        String key = (geminiKey == null) ? "" : geminiKey.trim();
+        String key = (groqKey == null) ? "" : groqKey.trim();
         if (key.isEmpty()) {
-            throw new RuntimeException("GEMINI_API_KEY missing in environment variables.");
+            // no key => don't crash
+            return "Unknown";
         }
 
-        // pick a working model (once) and cache it
-        String modelName = (cachedModelName != null) ? cachedModelName : pickGenerateContentModel(key);
-        cachedModelName = modelName;
+        // Try a commonly-available Groq model (works on most accounts)
+        // If your account has different, we'll adjust after seeing error body.
+        String model = "llama-3.1-8b-instant";
 
-        // API expects: /v1beta/{model=models/*}:generateContent
-        String path = "/v1beta/" + modelName + ":generateContent?key=" + key;
 
         Map<String, Object> payload = Map.of(
-                "contents", List.of(
-                        Map.of("role", "user",
-                                "parts", List.of(
-                                        Map.of("text",
-                                                "Answer in exactly ONE WORD only (no punctuation). " +
-                                                "If unsure, still return ONE best guess word.\nQuestion: " + q)
-                                ))
+                "model", model,
+                "messages", List.of(
+                        Map.of("role", "system", "content", "You must answer in exactly ONE WORD only. No punctuation."),
+                        Map.of("role", "user", "content", q)
                 ),
-                "generationConfig", Map.of("temperature", 0.2, "maxOutputTokens", 16)
+                "temperature", 0.2,
+                "max_tokens", 16,
+                "stream", false
         );
 
         try {
             Map<?, ?> resp = webClient.post()
-                    .uri(path)
-                    .contentType(MediaType.APPLICATION_JSON)
+                    .uri("/chat/completions")
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + key)
                     .accept(MediaType.APPLICATION_JSON)
                     .bodyValue(payload)
                     .retrieve()
@@ -69,97 +67,30 @@ public class GeminiService {
                     .timeout(Duration.ofSeconds(20))
                     .block();
 
-            if (resp == null) throw new RuntimeException("Gemini returned empty response.");
+            if (resp == null) return "Unknown";
 
-            Object candObj = resp.get("candidates");
-            if (!(candObj instanceof List<?> candidates) || candidates.isEmpty()) {
-                throw new RuntimeException("Gemini returned no candidates.");
-            }
+            List<?> choices = (List<?>) resp.get("choices");
+            if (choices == null || choices.isEmpty()) return "Unknown";
 
-            if (!(candidates.get(0) instanceof Map<?, ?> c0)) {
-                throw new RuntimeException("Gemini candidate format invalid.");
-            }
+            Map<?, ?> c0 = (Map<?, ?>) choices.get(0);
+            Map<?, ?> message = (Map<?, ?>) c0.get("message");
+            String text = String.valueOf(message.get("content"));
 
-            Object contentObj = c0.get("content");
-            if (!(contentObj instanceof Map<?, ?> content)) {
-                throw new RuntimeException("Gemini content missing.");
-            }
-
-            Object partsObj = content.get("parts");
-            if (!(partsObj instanceof List<?> parts) || parts.isEmpty()) {
-                throw new RuntimeException("Gemini returned empty parts.");
-            }
-
-            if (!(parts.get(0) instanceof Map<?, ?> p0)) {
-                throw new RuntimeException("Gemini part format invalid.");
-            }
-
-            String text = String.valueOf(p0.get("text"));
-            String one = extractFirstWord(text);
-            if (one.isEmpty()) throw new RuntimeException("Could not extract single-word answer: " + text);
-
-            return one;
+            String one = firstWord(text);
+            return one.isEmpty() ? "Unknown" : one;
 
         } catch (WebClientResponseException e) {
-            throw new RuntimeException("Gemini HTTP error: " + e.getStatusCode().value() + " :: " + e.getResponseBodyAsString());
+            // Print exact reason to terminal
+            System.out.println("GROQ HTTP: " + e.getStatusCode().value());
+            System.out.println("GROQ BODY: " + e.getResponseBodyAsString());
+            return "Unknown";
         } catch (Exception e) {
-            throw new RuntimeException("Gemini request failed: " + e.getMessage());
+            e.printStackTrace();
+            return "Unknown";
         }
     }
 
-    private String pickGenerateContentModel(String key) {
-        String listPath = "/v1beta/models?key=" + key;
-
-        try {
-            Map<?, ?> resp = webClient.get()
-                    .uri(listPath)
-                    .accept(MediaType.APPLICATION_JSON)
-                    .retrieve()
-                    .bodyToMono(Map.class)
-                    .timeout(Duration.ofSeconds(20))
-                    .block();
-
-            if (resp == null) throw new RuntimeException("models.list returned empty response.");
-
-            Object modelsObj = resp.get("models");
-            if (!(modelsObj instanceof List<?> models) || models.isEmpty()) {
-                throw new RuntimeException("No models available for this API key.");
-            }
-
-            for (Object o : models) {
-                if (!(o instanceof Map<?, ?> m)) continue;
-
-                Object nameObj = m.get("name"); // e.g. "models/gemini-2.0-flash"
-                if (!(nameObj instanceof String name) || name.isBlank()) continue;
-
-                // new docs mention "supportedActions", some responses use "supportedGenerationMethods"
-                Object actionsObj = m.get("supportedActions");
-                Object methodsObj = m.get("supportedGenerationMethods");
-
-                if (supportsGenerateContent(actionsObj) || supportsGenerateContent(methodsObj)) {
-                    // return full "models/xxx" name
-                    return name;
-                }
-            }
-
-            throw new RuntimeException("No available model supports generateContent for this API key.");
-
-        } catch (WebClientResponseException e) {
-            throw new RuntimeException("models.list HTTP error: " + e.getStatusCode().value() + " :: " + e.getResponseBodyAsString());
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to list models: " + e.getMessage());
-        }
-    }
-
-    private boolean supportsGenerateContent(Object obj) {
-        if (!(obj instanceof List<?> list)) return false;
-        for (Object x : list) {
-            if ("generateContent".equals(String.valueOf(x))) return true;
-        }
-        return false;
-    }
-
-    private String extractFirstWord(String text) {
+    private String firstWord(String text) {
         if (text == null) return "";
         Matcher m = Pattern.compile("[A-Za-z0-9]+").matcher(text);
         return m.find() ? m.group() : "";
