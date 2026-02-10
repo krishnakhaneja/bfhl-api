@@ -40,7 +40,7 @@ public class GeminiService {
         }
 
         // Correct Gemini endpoint (v1beta)
-        String path = "/v1beta/models/gemini-1.5-flash:generateContent?key=" + key;
+        String path = "/v1beta/models/gemini-pro:generateContent?key=" + key;
 
         // Payload
         Map<String, Object> payload = Map.of(
