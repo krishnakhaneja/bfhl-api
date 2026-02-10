@@ -19,30 +19,30 @@ public class GeminiService {
     @Value("${GEMINI_API_KEY:}")
     private String geminiKey;
 
-    private final WebClient webClient;
-
-    public GeminiService() {
-        this.webClient = WebClient.builder()
-                .baseUrl("https://generativelanguage.googleapis.com")
-                .build();
-    }
+    private final WebClient webClient = WebClient.builder()
+            .baseUrl("https://generativelanguage.googleapis.com")
+            .build();
 
     public String oneWordAnswer(String question) {
+        // Validate input
         if (question == null || question.trim().isEmpty()) {
             throw new BadRequestException("AI must be a non-empty string.");
         }
-        if (question.length() > 500) {
+        String q = question.trim();
+        if (q.length() > 500) {
             throw new BadRequestException("AI string too long (max 500).");
         }
 
+        // Validate key
         String key = (geminiKey == null) ? "" : geminiKey.trim();
         if (key.isEmpty()) {
-            // This will become 500 via global handler
             throw new RuntimeException("GEMINI_API_KEY missing in environment variables.");
         }
 
+        // Correct Gemini endpoint (v1beta)
         String path = "/v1beta/models/gemini-1.5-flash:generateContent?key=" + key;
 
+        // Payload
         Map<String, Object> payload = Map.of(
                 "contents", List.of(
                         Map.of(
@@ -50,7 +50,7 @@ public class GeminiService {
                                 "parts", List.of(
                                         Map.of("text",
                                                 "Answer in exactly ONE WORD only (no punctuation). " +
-                                                "If unsure, still return ONE best guess word.\nQuestion: " + question)
+                                                "If unsure, still return ONE best guess word.\nQuestion: " + q)
                                 )
                         )
                 ),
@@ -68,32 +68,49 @@ public class GeminiService {
                     .bodyValue(payload)
                     .retrieve()
                     .bodyToMono(Map.class)
-                    .timeout(Duration.ofSeconds(15))
+                    .timeout(Duration.ofSeconds(20))
                     .block();
 
+            if (resp == null) {
+                throw new RuntimeException("Gemini returned empty response.");
+            }
+
             // Extract candidates[0].content.parts[0].text
-            List<?> candidates = (List<?>) resp.get("candidates");
-            if (candidates == null || candidates.isEmpty()) {
+            Object candObj = resp.get("candidates");
+            if (!(candObj instanceof List<?> candidates) || candidates.isEmpty()) {
                 throw new RuntimeException("Gemini returned no candidates.");
             }
-            Map<?, ?> c0 = (Map<?, ?>) candidates.get(0);
-            Map<?, ?> content = (Map<?, ?>) c0.get("content");
-            List<?> parts = (List<?>) content.get("parts");
-            if (parts == null || parts.isEmpty()) {
+
+            if (!(candidates.get(0) instanceof Map<?, ?> c0)) {
+                throw new RuntimeException("Gemini candidate format invalid.");
+            }
+
+            Object contentObj = c0.get("content");
+            if (!(contentObj instanceof Map<?, ?> content)) {
+                throw new RuntimeException("Gemini content missing.");
+            }
+
+            Object partsObj = content.get("parts");
+            if (!(partsObj instanceof List<?> parts) || parts.isEmpty()) {
                 throw new RuntimeException("Gemini returned empty parts.");
             }
-            Map<?, ?> p0 = (Map<?, ?>) parts.get(0);
-            String text = String.valueOf(p0.get("text"));
 
+            if (!(parts.get(0) instanceof Map<?, ?> p0)) {
+                throw new RuntimeException("Gemini part format invalid.");
+            }
+
+            String text = String.valueOf(p0.get("text"));
             String one = extractFirstWord(text);
+
             if (one.isEmpty()) {
-                throw new RuntimeException("Could not extract single-word answer from Gemini.");
+                throw new RuntimeException("Could not extract single-word answer from Gemini text: " + text);
             }
             return one;
 
         } catch (WebClientResponseException e) {
-            // If key invalid etc.
-            throw new RuntimeException("Gemini API HTTP error: " + e.getStatusCode().value());
+            // IMPORTANT: include status + response body for debugging (helps fix 404/401/403)
+            String body = e.getResponseBodyAsString();
+            throw new RuntimeException("Gemini HTTP error: " + e.getStatusCode().value() + " :: " + body);
         } catch (Exception e) {
             throw new RuntimeException("Gemini request failed: " + e.getMessage());
         }
